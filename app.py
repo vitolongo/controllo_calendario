@@ -1,6 +1,6 @@
 """
 MOHOLE - Dashboard Controllo Ore Docenti
-Versione 2.1 - Upload Manuale
+Versione 2.2 - Report Migliorati
 """
 
 import streamlit as st
@@ -8,6 +8,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, time
 from io import BytesIO
+from itertools import combinations
 
 # ========== CONFIGURAZIONE ==========
 st.set_page_config(
@@ -74,6 +75,7 @@ def normalize_dataframe(df):
     df['_cf_norm'] = df['Codice Fiscale'].astype(str).str.strip().str.upper()
     df['_computed_hours'] = ((df['_end_dt'] - df['_start_dt']) / pd.Timedelta(hours=1)).round(2)
     df['_declared_hours'] = pd.to_numeric(df['TOTALE_ORE'], errors='coerce').round(2)
+    df['_original_row'] = df.index + 2  # Numero riga Excel (header + offset)
     
     return df
 
@@ -88,55 +90,74 @@ def check_hours(df, tolerance=0.02):
     errors = df[mismatch_mask].copy()
     errors['Diff (ore)'] = (errors['_computed_hours'] - errors['_declared_hours']).round(2)
     
-    return errors[['DATA LEZIONE', 'ORA_INIZIO', 'ORA_FINE', 'TOTALE_ORE', '_computed_hours', 'Diff (ore)', 'Codice Fiscale']]
+    return errors[['_original_row', 'DATA LEZIONE', 'ORA_INIZIO', 'ORA_FINE', 'TOTALE_ORE', '_computed_hours', 'Diff (ore)', 'Codice Fiscale']].rename(columns={'_original_row': 'Riga Excel'})
 
 def check_duplicates(df):
-    """Trova record identici su A-F"""
+    """Trova record identici su A-F e genera report coppie"""
     df_work = df.copy()
     df_work['_start_str'] = df_work['_start_time'].apply(lambda x: x.strftime('%H:%M') if isinstance(x, time) else '')
     df_work['_end_str'] = df_work['_end_time'].apply(lambda x: x.strftime('%H:%M') if isinstance(x, time) else '')
     
     key_cols_str = ['_date', '_start_str', '_end_str', 'SEDE', '_cf_norm']
     df_work['_key'] = df_work[key_cols_str].astype(str).agg('|'.join, axis=1)
-    duplicates_mask = df_work.duplicated(subset='_key', keep=False)
     
+    # Trova tutti i duplicati
+    duplicates_mask = df_work.duplicated(subset='_key', keep=False)
     dups = df_work[duplicates_mask].sort_values(key_cols_str)
     
     if dups.empty:
         return pd.DataFrame()
     
-    cols_to_show = ['DATA LEZIONE', 'ORA_INIZIO', 'ORA_FINE', 'TOTALE_ORE', 'SEDE', 'Codice Fiscale']
-    if 'Materia' in dups.columns:
-        cols_to_show.append('Materia')
+    # Genera coppie di duplicati
+    duplicate_pairs = []
     
-    return dups[cols_to_show]
+    for key_val, group in dups.groupby('_key'):
+        if len(group) < 2:
+            continue
+        
+        # Genera tutte le coppie
+        rows = group.sort_values('_original_row')
+        for (idx1, row1), (idx2, row2) in combinations(rows.iterrows(), 2):
+            duplicate_pairs.append({
+                'Riga X': int(row1['_original_row']),
+                'Riga Y': int(row2['_original_row']),
+                'Data Lezione': row1['_date'].strftime('%Y-%m-%d') if pd.notna(row1['_date']) else '',
+                'Codice Fiscale': row1['_cf_norm'],
+                'Ora Inizio': row1['_start_str'],
+                'Ora Fine': row1['_end_str'],
+                'Sede': row1['SEDE']
+            })
+    
+    return pd.DataFrame(duplicate_pairs)
 
 def check_overlaps(df):
-    """Trova sovrapposizioni orarie per (data, CF)"""
+    """Trova sovrapposizioni orarie per (data, CF) con info righe"""
     work = df[df['_start_dt'].notna() & df['_end_dt'].notna() & (df['_cf_norm'] != '')].copy()
     work['_date_str'] = work['_date'].dt.strftime('%Y-%m-%d')
-    work['_row'] = range(len(work))
     
     overlaps = []
     
     for (date_key, cf), g in work.groupby(['_date_str', '_cf_norm']):
-        g = g.sort_values('_start_dt')
-        active = []
+        g = g.sort_values('_start_dt').reset_index(drop=True)
         
-        for _, r in g.iterrows():
-            active = [a for a in active if a[0] > r['_start_dt']]
-            
-            for end_time, prev_idx, start_time in active:
-                overlaps.append({
-                    'DATA LEZIONE': date_key,
-                    'Codice Fiscale': cf,
-                    'Ora inizio 1': start_time.strftime('%H:%M'),
-                    'Ora fine 1': end_time.strftime('%H:%M'),
-                    'Ora inizio 2': r['_start_dt'].strftime('%H:%M'),
-                    'Ora fine 2': r['_end_dt'].strftime('%H:%M')
-                })
-            
-            active.append((r['_end_dt'], r['_row'], r['_start_dt']))
+        # Confronta ogni coppia di lezioni
+        for i in range(len(g)):
+            for j in range(i + 1, len(g)):
+                row_i = g.iloc[i]
+                row_j = g.iloc[j]
+                
+                # Controlla sovrapposizione: inizio_j < fine_i
+                if row_j['_start_dt'] < row_i['_end_dt']:
+                    overlaps.append({
+                        'Data Lezione': date_key,
+                        'Codice Fiscale': cf,
+                        'Riga X': int(row_i['_original_row']),
+                        'Riga Y': int(row_j['_original_row']),
+                        'Ora Inizio X': row_i['_start_dt'].strftime('%H:%M'),
+                        'Ora Fine X': row_i['_end_dt'].strftime('%H:%M'),
+                        'Ora Inizio Y': row_j['_start_dt'].strftime('%H:%M'),
+                        'Ora Fine Y': row_j['_end_dt'].strftime('%H:%M')
+                    })
     
     return pd.DataFrame(overlaps)
 
@@ -232,7 +253,7 @@ def main():
     
     with col3:
         delta_color = "off" if len(duplicates_df) == 0 else "inverse"
-        st.metric("🔄 Duplicati", len(duplicates_df), delta_color=delta_color)
+        st.metric("🔄 Coppie Duplicate", len(duplicates_df), delta_color=delta_color)
     
     with col4:
         delta_color = "off" if len(overlaps_df) == 0 else "inverse"
@@ -251,11 +272,12 @@ def main():
             st.dataframe(errors_df, use_container_width=True)
     
     with tab2:
-        st.subheader("Record Duplicati (A-F identici)")
+        st.subheader("Coppie di Record Duplicati")
         if duplicates_df.empty:
             st.success("✅ Nessun duplicato trovato!")
         else:
-            st.warning(f"⚠️ Trovati {len(duplicates_df)} record duplicati")
+            st.warning(f"⚠️ Trovate {len(duplicates_df)} coppie di duplicati")
+            st.info("💡 Ogni coppia mostra due righe Excel identiche su Data, Orari, Sede e Codice Fiscale")
             st.dataframe(duplicates_df, use_container_width=True)
     
     with tab3:
@@ -264,6 +286,7 @@ def main():
             st.success("✅ Nessuna sovrapposizione trovata!")
         else:
             st.warning(f"⚠️ Trovate {len(overlaps_df)} sovrapposizioni")
+            st.info("💡 Riga X e Riga Y indicano le righe Excel con orari sovrapposti per lo stesso docente nella stessa data")
             st.dataframe(overlaps_df, use_container_width=True)
     
     # Export button
