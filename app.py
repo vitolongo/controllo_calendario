@@ -1,6 +1,6 @@
 """
 MOHOLE - Dashboard Controllo Ore Docenti
-Versione 2.0 - Google Sheets Integration
+Versione 2.1 - Upload Manuale
 """
 
 import streamlit as st
@@ -8,8 +8,6 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, time
 from io import BytesIO
-import gspread
-from google.oauth2.service_account import Credentials
 
 # ========== CONFIGURAZIONE ==========
 st.set_page_config(
@@ -19,35 +17,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ========== GOOGLE SHEETS CONNECTION ==========
-
-@st.cache_resource
-def get_google_client():
-    """Connessione a Google Sheets con credenziali da Streamlit Secrets"""
-    scope = [
-        "https://www.googleapis.com/auth/spreadsheets.readonly",
-        "https://www.googleapis.com/auth/drive.readonly"
-    ]
-    
-    # Credenziali da st.secrets (configurate su Streamlit Cloud)
-    creds_dict = st.secrets["gcp_service_account"]
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
-    return gspread.authorize(creds)
-
-@st.cache_data(ttl=300)  # Cache per 5 minuti
-def load_google_sheet(sheet_url, worksheet_name="Foglio1"):
-    """Carica dati da Google Sheets"""
-    try:
-        client = get_google_client()
-        sheet = client.open_by_url(sheet_url)
-        worksheet = sheet.worksheet(worksheet_name)
-        data = worksheet.get_all_records()
-        return pd.DataFrame(data)
-    except Exception as e:
-        st.error(f"❌ Errore connessione Google Sheets: {str(e)}")
-        return None
-
-# ========== FUNZIONI DI UTILITÀ (stesse di prima) ==========
+# ========== FUNZIONI DI UTILITÀ ==========
 
 def parse_time(x):
     """Converte vari formati orari in time object"""
@@ -107,8 +77,6 @@ def normalize_dataframe(df):
     
     return df
 
-# ========== CONTROLLI (stessi di prima) ==========
-
 def check_hours(df, tolerance=0.02):
     """Controlla coerenza TOTALE_ORE vs differenza oraria"""
     mismatch_mask = (
@@ -137,7 +105,11 @@ def check_duplicates(df):
     if dups.empty:
         return pd.DataFrame()
     
-    return dups[['DATA LEZIONE', 'ORA_INIZIO', 'ORA_FINE', 'TOTALE_ORE', 'SEDE', 'Codice Fiscale', 'Materia']]
+    cols_to_show = ['DATA LEZIONE', 'ORA_INIZIO', 'ORA_FINE', 'TOTALE_ORE', 'SEDE', 'Codice Fiscale']
+    if 'Materia' in dups.columns:
+        cols_to_show.append('Materia')
+    
+    return dups[cols_to_show]
 
 def check_overlaps(df):
     """Trova sovrapposizioni orarie per (data, CF)"""
@@ -183,62 +155,61 @@ def to_excel(errors_df, duplicates_df, overlaps_df):
 
 def main():
     st.title("📊 Mohole - Dashboard Controllo Ore Docenti")
-    st.markdown("**Connessione Live a Google Sheets** - Aggiornamento automatico")
+    st.markdown("Sistema automatico di verifica qualità dati lezioni")
     
     # Sidebar
     with st.sidebar:
-        st.header("⚙️ Configurazione")
-        
-        # URL Google Sheets
-        default_url = st.secrets.get("sheet_url", "")
-        sheet_url = st.text_input(
-            "🔗 URL Google Sheets",
-            value=default_url,
-            help="Incolla l'URL del tuo Google Sheets"
-        )
-        
-        worksheet_name = st.text_input(
-            "📄 Nome Foglio",
-            value="Foglio1",
-            help="Nome del foglio da analizzare"
-        )
+        st.header("⚙️ Impostazioni")
         
         tolerance = st.slider(
             "Tolleranza errori ore (minuti)",
             min_value=0,
             max_value=5,
-            value=1
+            value=1,
+            help="Tolleranza accettabile per differenze TOTALE_ORE"
         ) / 60.0
         
-        # Pulsante refresh manuale
-        if st.button("🔄 Aggiorna Dati", type="primary"):
-            st.cache_data.clear()
-            st.rerun()
-        
         st.markdown("---")
-        st.markdown("### ℹ️ Info")
-        st.info("I dati vengono aggiornati automaticamente ogni 5 minuti o tramite pulsante Aggiorna")
+        st.markdown("### 📖 Istruzioni")
+        st.markdown("""
+        1. Carica file Excel con dati lezioni
+        2. Verifica i controlli automatici
+        3. Scarica report errori se necessario
+        
+        **Colonne richieste:**
+        - DATA LEZIONE
+        - TOTALE_ORE
+        - ORA_INIZIO
+        - ORA_FINE
+        - SEDE
+        - Codice Fiscale
+        """)
     
-    if not sheet_url:
-        st.warning("👈 Inserisci l'URL del Google Sheets nella sidebar")
+    # Upload file
+    uploaded_file = st.file_uploader(
+        "📁 Carica file Excel",
+        type=['xlsx', 'xls'],
+        help="Formato supportato: Excel (.xlsx, .xls)"
+    )
+    
+    if not uploaded_file:
+        st.info("👆 Carica un file Excel per iniziare l'analisi")
         st.stop()
     
-    # Carica dati
-    with st.spinner("📡 Connessione a Google Sheets..."):
-        df_raw = load_google_sheet(sheet_url, worksheet_name)
+    # Read file
+    try:
+        with st.spinner("📖 Lettura file..."):
+            df_raw = pd.read_excel(uploaded_file)
+            df = normalize_dataframe(df_raw)
+        
+        if df is None:
+            st.stop()
+        
+        st.success(f"✅ File caricato: {len(df)} righe")
     
-    if df_raw is None or df_raw.empty:
-        st.error("❌ Impossibile caricare dati o foglio vuoto")
+    except Exception as e:
+        st.error(f"❌ Errore lettura file: {str(e)}")
         st.stop()
-    
-    df = normalize_dataframe(df_raw)
-    
-    if df is None:
-        st.stop()
-    
-    # Mostra ultimo aggiornamento
-    last_update = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    st.success(f"✅ Dati caricati: {len(df)} righe | Ultimo aggiornamento: {last_update}")
     
     # Run checks
     with st.spinner("🔍 Esecuzione controlli..."):
@@ -274,13 +245,13 @@ def main():
     with tab1:
         st.subheader("Errori TOTALE_ORE vs Differenza Oraria")
         if errors_df.empty:
-            st.success("✅ Nessun errore trovato!")
+            st.success("✅ Nessun errore trovato! Tutti i valori TOTALE_ORE sono coerenti.")
         else:
             st.warning(f"⚠️ Trovati {len(errors_df)} errori")
             st.dataframe(errors_df, use_container_width=True)
     
     with tab2:
-        st.subheader("Record Duplicati")
+        st.subheader("Record Duplicati (A-F identici)")
         if duplicates_df.empty:
             st.success("✅ Nessun duplicato trovato!")
         else:
@@ -288,7 +259,7 @@ def main():
             st.dataframe(duplicates_df, use_container_width=True)
     
     with tab3:
-        st.subheader("Sovrapposizioni Orarie")
+        st.subheader("Sovrapposizioni Orarie (stessa data e CF)")
         if overlaps_df.empty:
             st.success("✅ Nessuna sovrapposizione trovata!")
         else:
